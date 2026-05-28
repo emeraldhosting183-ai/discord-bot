@@ -34,12 +34,18 @@ const commands = [
 ].map(cmd => cmd.toJSON());
 
 async function registerCommands() {
-  if (!CLIENT_ID) return;
+  if (!CLIENT_ID) {
+    console.log("⚠️ CLIENT_ID не установлен");
+    return;
+  }
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   try {
+    console.log(`📝 Регистрирую ${commands.length} команд...`);
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
     console.log("✅ Slash команды зарегистрированы");
-  } catch (e) { console.error(e); }
+  } catch (e) { 
+    console.error("❌ Ошибка регистрации команд:", e);
+  }
 }
 
 client.once(Events.ClientReady, async (c) => {
@@ -157,7 +163,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     });
   }
 
-  // ── Кнопка части 2 ────────────────────────────────────────────────────────
+  // ── Кнопка части 2 ─────────────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId.startsWith("anketa_p2_")) {
     const modal2 = new ModalBuilder()
       .setCustomId("anketa_modal2_" + interaction.customId.slice(10))
@@ -241,3 +247,4 @@ function decodeData(str) {
 }
 
 client.login(TOKEN);
+
