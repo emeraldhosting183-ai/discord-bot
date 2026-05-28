@@ -22,6 +22,7 @@ const client = new Client({
 });
 
 let botClosed = false;
+const anketaData = new Map();
 const CLOSED_MESSAGE = "🔒 Бот временно закрыт\n\nМы готовим что-то новое — бот будет недоступен до релиза.";
 function isOwner(userId) { return OWNER_ID && userId === OWNER_ID; }
 
@@ -55,7 +56,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const cmd = interaction.commandName;
 
     if (botClosed && !(cmd === "закрыть" && isOwner(userId))) {
-      return interaction.reply({ content: CLOSED_MESSAGE, ephemeral: true });
+      return interaction.reply({ content: CLOSED_MESSAGE, flags: 64 });
     }
 
     if (cmd === "пинг") {
@@ -85,12 +86,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ embeds: [embed] });
 
     } else if (cmd === "закрыть") {
-      if (!isOwner(userId)) return interaction.reply({ content: "⛔ Нет доступа.", ephemeral: true });
+      if (!isOwner(userId)) return interaction.reply({ content: "⛔ Нет доступа.", flags: 64 });
       botClosed = !botClosed;
-      await interaction.reply({ content: botClosed ? "🔒 Бот закрыт." : "🔓 Бот открыт.", ephemeral: true });
+      await interaction.reply({ content: botClosed ? "🔒 Бот закрыт." : "🔓 Бот открыт.", flags: 64 });
 
     } else if (cmd === "анкета-канал") {
-      if (!isOwner(userId)) return interaction.reply({ content: "⛔ Нет доступа.", ephemeral: true });
+      if (!isOwner(userId)) return interaction.reply({ content: "⛔ Нет доступа.", flags: 64 });
 
       const embed = new EmbedBuilder()
         .setColor(0x57F287)
@@ -111,7 +112,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await interaction.channel.send({ embeds: [embed], components: [row] });
-      await interaction.reply({ content: "✅ Кнопка анкеты отправлена!", ephemeral: true });
+      await interaction.reply({ content: "✅ Кнопка анкеты отправлена!", flags: 64 });
     }
   }
 
@@ -142,10 +143,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const tgNick = interaction.fields.getTextInputValue("tg_nick");
     const timeInGroup = interaction.fields.getTextInputValue("time_in_group");
 
-    // Сохраняем и показываем вторую часть
+    // Сохраняем данные в памяти и показываем вторую часть
+    const dataKey = `${interaction.user.id}_${Date.now()}`;
+    anketaData.set(dataKey, { name, birthday, mcNick, tgNick, timeInGroup });
+
     const row2 = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId(`anketa_p2_${interaction.user.id}_${encodeData(name, birthday, mcNick, tgNick, timeInGroup)}`)
+        .setCustomId(`anketa_p2_${dataKey}`)
         .setLabel("➡️ Продолжить — Часть 2")
         .setStyle(ButtonStyle.Primary)
     );
@@ -153,14 +157,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.reply({
       content: "✅ Часть 1 принята! Нажми кнопку чтобы заполнить вторую часть.",
       components: [row2],
-      ephemeral: true
+      flags: 64
     });
   }
 
   // ── Кнопка части 2 ────────────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId.startsWith("anketa_p2_")) {
+    const dataKey = interaction.customId.slice("anketa_p2_".length);
     const modal2 = new ModalBuilder()
-      .setCustomId("anketa_modal2_" + interaction.customId.slice(10))
+      .setCustomId("anketa_modal2_" + dataKey)
       .setTitle("📋 Анкета — Часть 2");
 
     const fields2 = [
@@ -178,11 +183,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   // ── Модальное окно часть 2 ────────────────────────────────────────────────
   if (interaction.isModalSubmit() && interaction.customId.startsWith("anketa_modal2_")) {
-    const raw = interaction.customId.slice("anketa_modal2_".length);
-    const parts = raw.split("_");
-    // parts[0] = userId, parts[1..] = encoded data
-    const encoded = parts.slice(1).join("_");
-    const [name, birthday, mcNick, tgNick, timeInGroup] = decodeData(encoded);
+    const dataKey = interaction.customId.slice("anketa_modal2_".length);
+    const stored = anketaData.get(dataKey) || {};
+    anketaData.delete(dataKey);
+    const { name = "?", birthday = "?", mcNick = "?", tgNick = "?", timeInGroup = "?" } = stored;
 
     const pc = interaction.fields.getTextInputValue("pc");
     const whoInvited = interaction.fields.getTextInputValue("who_invited");
@@ -225,19 +229,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     await interaction.reply({
       content: "✅ Анкета отправлена! Ожидай проверки от администрации.",
-      ephemeral: true
+      flags: 64
     });
   }
 });
-
-// Хелперы для передачи данных между модальными окнами
-function encodeData(...args) {
-  return args.map(a => Buffer.from(a).toString("base64").replace(/=/g, "")).join("|").slice(0, 80);
-}
-function decodeData(str) {
-  try {
-    return str.split("|").map(s => Buffer.from(s, "base64").toString());
-  } catch { return ["?", "?", "?", "?", "?"]; }
-}
 
 client.login(TOKEN);
