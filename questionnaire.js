@@ -346,7 +346,7 @@ async function handleQuestionnaire(interaction) {
 
     const embeds = buildAdminEmbed(interaction.user, newAnswers);
     await adminChannel.send({
-      content: `📥 Поступила новая анкета от пользователя ${interaction.user}`,
+      content: `📋 Анкета от пользователя ${interaction.user}`,
       embeds,
     });
 
