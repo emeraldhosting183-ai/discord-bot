@@ -5,10 +5,11 @@ const {
   ModalBuilder, TextInputBuilder, TextInputStyle
 } = require("discord.js");
 
+const { initQuestionnaire, handleQuestionnaire } = require('./questionnaire');
+
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const OWNER_ID = process.env.OWNER_ID || "";
-const ANKETA_CHANNEL_ID = "1504215282854527016";
 
 if (!TOKEN) throw new Error("DISCORD_TOKEN не задан");
 
@@ -22,7 +23,6 @@ const client = new Client({
 });
 
 let botClosed = false;
-const anketaData = new Map();
 const CLOSED_MESSAGE = "🔒 Бот временно закрыт\n\nМы готовим что-то новое — бот будет недоступен до релиза.";
 function isOwner(userId) { return OWNER_ID && userId === OWNER_ID; }
 
@@ -31,7 +31,6 @@ const commands = [
   new SlashCommandBuilder().setName("помощь").setDescription("Список команд"),
   new SlashCommandBuilder().setName("сервер").setDescription("Инфо о сервере"),
   new SlashCommandBuilder().setName("закрыть").setDescription("🔒 Закрыть/открыть бота (только владелец)"),
-  new SlashCommandBuilder().setName("анкета-канал").setDescription("📋 Отправить кнопку анкеты в этот канал (только владелец)"),
   new SlashCommandBuilder().setName("тикет-настройка").setDescription("🎫 Отправить панель тикетов в этот канал (только владелец)"),
 ].map(cmd => cmd.toJSON());
 
@@ -47,6 +46,7 @@ async function registerCommands() {
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Бот запущен как ${c.user.tag}`);
   await registerCommands();
+  await initQuestionnaire(client);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -91,29 +91,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       botClosed = !botClosed;
       await interaction.reply({ content: botClosed ? "🔒 Бот закрыт." : "🔓 Бот открыт.", flags: 64 });
 
-    } else if (cmd === "анкета-канал") {
-      if (!isOwner(userId)) return interaction.reply({ content: "⛔ Нет доступа.", flags: 64 });
-
-      const embed = new EmbedBuilder()
-        .setColor(0x57F287)
-        .setTitle("📋 Анкета нового сезона")
-        .setDescription(
-          "Привет! Для участия в проекте необходимо заполнить анкету.\n\n" +
-          "Нажми кнопку ниже и заполни все поля.\n" +
-          "После отправки твоя анкета появится у администрации.\n\n" +
-          "⚠️ **Анкета обязательна для доступа к серверу!**"
-        )
-        .setFooter({ text: "Заполни анкету честно и внимательно" });
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("open_anketa")
-          .setLabel("📝 Заполнить анкету")
-          .setStyle(ButtonStyle.Success)
-      );
-
-      await interaction.channel.send({ embeds: [embed], components: [row] });
-      await interaction.reply({ content: "✅ Кнопка анкеты отправлена!", flags: 64 });
     } else if (cmd === "тикет-настройка") {
       if (!isOwner(userId)) return interaction.reply({ content: "⛔ Нет доступа.", flags: 64 });
 
@@ -138,77 +115,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // ── Кнопка анкеты ──────────────────────────────────────────────────────────
-  if (interaction.isButton() && interaction.customId === "open_anketa") {
-    const modal = new ModalBuilder()
-      .setCustomId("anketa_modal")
-      .setTitle("📋 Анкета — Часть 1");
-
-    const fields = [
-      new TextInputBuilder().setCustomId("name").setLabel("Имя (реальное)").setStyle(TextInputStyle.Short).setRequired(true),
-      new TextInputBuilder().setCustomId("birthday").setLabel("Дата рождения (ДД.ММ.ГГГГ) и возраст").setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("Пример: 08.02.2008 | 17 лет"),
-      new TextInputBuilder().setCustomId("mc_nick").setLabel("Ник в Minecraft").setStyle(TextInputStyle.Short).setRequired(true),
-      new TextInputBuilder().setCustomId("tg_nick").setLabel("Ник в Telegram").setStyle(TextInputStyle.Short).setRequired(true),
-      new TextInputBuilder().setCustomId("time_in_group").setLabel("Сколько ты в группе? (из TG «Кто я»)").setStyle(TextInputStyle.Short).setRequired(true),
-    ];
-
-    const rows = fields.map(f => new ActionRowBuilder().addComponents(f));
-    modal.addComponents(...rows);
-    await interaction.showModal(modal);
-  }
-
-  // ── Модальное окно часть 1 ─────────────────────────────────────────────────
-  if (interaction.isModalSubmit() && interaction.customId === "anketa_modal") {
-    const name = interaction.fields.getTextInputValue("name");
-    const birthday = interaction.fields.getTextInputValue("birthday");
-    const mcNick = interaction.fields.getTextInputValue("mc_nick");
-    const tgNick = interaction.fields.getTextInputValue("tg_nick");
-    const timeInGroup = interaction.fields.getTextInputValue("time_in_group");
-
-    // Сохраняем данные в памяти и показываем вторую часть
-    const dataKey = `${interaction.user.id}_${Date.now()}`;
-    anketaData.set(dataKey, { name, birthday, mcNick, tgNick, timeInGroup });
-
-    const row2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`anketa_p2_${dataKey}`)
-        .setLabel("➡️ Продолжить — Часть 2")
-        .setStyle(ButtonStyle.Primary)
-    );
-
-    await interaction.reply({
-      content: "✅ Часть 1 принята! Нажми кнопку чтобы заполнить вторую часть.",
-      components: [row2],
-      flags: 64
-    });
-  }
-
-  // ── Кнопка части 2 ────────────────────────────────────────────────────────
-  if (interaction.isButton() && interaction.customId.startsWith("anketa_p2_")) {
-    const dataKey = interaction.customId.slice("anketa_p2_".length);
-    const modal2 = new ModalBuilder()
-      .setCustomId("anketa_modal2_" + dataKey)
-      .setTitle("📋 Анкета — Часть 2");
-
-    const fields2 = [
-      new TextInputBuilder().setCustomId("pc").setLabel("Комплектующие ПК/ноута + FPS на Optifine 1.21+").setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder("Процессор, видеокарта, ОЗУ, Windows, ~FPS"),
-      new TextInputBuilder().setCustomId("who_invited").setLabel("Через кого попал в чат? (ник)").setStyle(TextInputStyle.Short).setRequired(true),
-      new TextInputBuilder().setCustomId("study").setLabel("Учишься? (Да/Нет — если да, класс/курс)").setStyle(TextInputStyle.Short).setRequired(true),
-      new TextInputBuilder().setCustomId("playtime").setLabel("Время игры + Java/Bedrock + интернет + микрофон").setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder("С скольки до скольки | Java/Bedrock | Интернет | Микрофон"),
-      new TextInputBuilder().setCustomId("goal").setLabel("Цель + страна + часовой пояс + сколько лет в MC").setStyle(TextInputStyle.Paragraph).setRequired(true),
-    ];
-
-    const rows2 = fields2.map(f => new ActionRowBuilder().addComponents(f));
-    modal2.addComponents(...rows2);
-    await interaction.showModal(modal2);
-  }
+  // ── Анкета (questionnaire.js) ──────────────────────────────────────────────
+  await handleQuestionnaire(interaction);
 
   // ── Создание тикета ───────────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId === "ticket_create") {
     const guild = interaction.guild;
     const user = interaction.user;
 
-    // Проверяем, нет ли уже открытого тикета у этого юзера
     const existing = guild.channels.cache.find(
       ch => ch.name === `ticket-${user.username.toLowerCase().replace(/[^a-z0-9]/g, "")}` ||
             ch.topic === `ticket:${user.id}`
@@ -220,18 +134,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
-    // Ищем категорию "Поддержка" (или берём без категории)
     const category = guild.channels.cache.find(
       ch => ch.type === 4 && ch.name.toLowerCase().includes("поддержк")
     );
 
-    // Ищем роль администрации
     const adminRole = guild.roles.cache.find(
       r => r.name === "ГЛ.АДМИНИСТРАЦИЯ" || r.name === "Senior Moderators" || r.permissions.has("Administrator")
     );
 
     const permissionOverwrites = [
-      { id: guild.id, deny: ["ViewChannel"] }, // @everyone не видит
+      { id: guild.id, deny: ["ViewChannel"] },
       { id: user.id, allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"] },
     ];
     if (adminRole) {
@@ -245,7 +157,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       ticketChannel = await guild.channels.create({
         name: `ticket-${user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20)}`,
-        type: 0, // GUILD_TEXT
+        type: 0,
         topic: `ticket:${user.id}`,
         parent: category?.id ?? null,
         permissionOverwrites,
@@ -280,7 +192,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isButton() && interaction.customId === "ticket_close") {
     const channel = interaction.channel;
 
-    // Проверяем что это тикет-канал
     if (!channel.topic?.startsWith("ticket:") && !channel.name.startsWith("ticket-")) {
       return interaction.reply({ content: "❌ Это не тикет-канал.", flags: 64 });
     }
@@ -289,57 +200,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     setTimeout(() => channel.delete("Тикет закрыт").catch(console.error), 5000);
   }
 
-  // ── Модальное окно часть 2 ────────────────────────────────────────────────
-  if (interaction.isModalSubmit() && interaction.customId.startsWith("anketa_modal2_")) {
-    const dataKey = interaction.customId.slice("anketa_modal2_".length);
-    const stored = anketaData.get(dataKey) || {};
-    anketaData.delete(dataKey);
-    const { name = "?", birthday = "?", mcNick = "?", tgNick = "?", timeInGroup = "?" } = stored;
-
-    const pc = interaction.fields.getTextInputValue("pc");
-    const whoInvited = interaction.fields.getTextInputValue("who_invited");
-    const study = interaction.fields.getTextInputValue("study");
-    const playtime = interaction.fields.getTextInputValue("playtime");
-    const goal = interaction.fields.getTextInputValue("goal");
-
-    const member = interaction.guild?.members?.cache.get(interaction.user.id);
-    const roles = member?.roles?.cache
-      .filter(r => r.id !== interaction.guild.id)
-      .map(r => r.name)
-      .join(", ") || "Нет ролей";
-
-    const embed = new EmbedBuilder()
-      .setColor(0x5865F2)
-      .setTitle("📋 Новая анкета")
-      .setThumbnail(interaction.user.displayAvatarURL())
-      .addFields(
-        { name: "👤 Discord", value: `${interaction.user} (${interaction.user.tag})`, inline: true },
-        { name: "🎭 Роли", value: roles, inline: true },
-        { name: "\u200b", value: "\u200b" },
-        { name: "📛 Имя", value: name, inline: true },
-        { name: "🎂 Дата рождения / Возраст", value: birthday, inline: true },
-        { name: "⛏️ Ник в Minecraft", value: mcNick, inline: true },
-        { name: "📱 Ник в Telegram", value: tgNick, inline: true },
-        { name: "⏱️ В группе с", value: timeInGroup, inline: true },
-        { name: "💻 ПК / FPS", value: pc },
-        { name: "👥 Пригласил", value: whoInvited, inline: true },
-        { name: "🎓 Учёба", value: study, inline: true },
-        { name: "🕐 Время игры / Java-Bedrock / Интернет / Микрофон", value: playtime },
-        { name: "🎯 Цель / Страна / Часовой пояс / Стаж в MC", value: goal },
-      )
-      .setTimestamp()
-      .setFooter({ text: `ID: ${interaction.user.id}` });
-
-    const anketaChannel = await client.channels.fetch(ANKETA_CHANNEL_ID).catch(() => null);
-    if (anketaChannel) {
-      await anketaChannel.send({ embeds: [embed] });
-    }
-
-    await interaction.reply({
-      content: "✅ Анкета отправлена! Ожидай проверки от администрации.",
-      flags: 64
-    });
-  }
 });
 
 client.login(TOKEN);
