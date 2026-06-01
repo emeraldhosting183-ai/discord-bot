@@ -26,7 +26,6 @@ const ANSWERS_FILE      = path.join(__dirname, 'answers.json');
 const BTN_START   = 'anket_start';           // кнопка «Заполнить анкету»
 const BTN_NEXT    = 'anket_next_';           // + номер шага (anket_next_1 … anket_next_7)
 const MODAL_STEP  = 'anket_modal_step_';     // + номер шага (1…8)
-const BTN_RESET   = 'anket_reset';           // кнопка «Сбросить анкету»
 
 // ─────────────────────────────────────────────
 //  ВОПРОСЫ — 40 штук, 8 групп по 5
@@ -328,21 +327,14 @@ async function handleQuestionnaire(interaction) {
     // ─ Последний шаг — отправляем анкету ─────────────────────
     deleteSession(interaction.user.id);
 
-    const resetBtn = new ButtonBuilder()
-      .setCustomId(BTN_RESET)
-      .setLabel('🔄 Сбросить анкету')
-      .setStyle(ButtonStyle.Danger);
-
     await interaction.reply({
       embeds: [
         new EmbedBuilder()
           .setColor(0x57f287)
           .setDescription(
-            '🎉 **Анкета отправлена!**\n\nМы рассмотрим её в ближайшее время и свяжемся с тобой.\n\n' +
-            'Если хочешь заполнить заново — нажми кнопку ниже.',
+            '🎉 **Анкета отправлена!**\n\nМы рассмотрим её в ближайшее время и свяжемся с тобой.',
           ),
       ],
-      components: [new ActionRowBuilder().addComponents(resetBtn)],
       ephemeral: true,
     });
 
@@ -359,17 +351,6 @@ async function handleQuestionnaire(interaction) {
     });
 
     console.log(`[Questionnaire] Анкета от ${interaction.user.tag} успешно отправлена.`);
-  }
-  // ── КНОПКА «Сбросить анкету» ────────────────────────────────
-  if (interaction.isButton() && interaction.customId === BTN_RESET) {
-    deleteSession(interaction.user.id);
-    return interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setDescription('🔄 Анкета сброшена. Нажми **«📝 Заполнить анкету»** в канале подачи заявок чтобы начать заново.'),
-      ],
-      ephemeral: true,
-    });
   }
 }
 
