@@ -195,15 +195,12 @@ function buildAdminEmbed(user, answers) {
 
   // Discord позволяет до 25 полей в одном Embed — делаем 2 эмбеда
   const embed1 = new EmbedBuilder()
-    .setTitle('📬 Новая анкета участника')
-    .setColor(0x57f287)
+    .setTitle(`📋 Анкета пользователя ${user.username}`)
     .setThumbnail(user.displayAvatarURL({ dynamic: true }))
     .setFooter({ text: `ID: ${user.id}` })
     .setTimestamp();
 
-  const embed2 = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle('📬 Продолжение анкеты');
+  const embed2 = new EmbedBuilder();
 
   allFields.forEach((f, i) => {
     const value = answers[f.id] || '—';
