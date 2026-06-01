@@ -32,6 +32,7 @@ const commands = [
   new SlashCommandBuilder().setName("сервер").setDescription("Инфо о сервере"),
   new SlashCommandBuilder().setName("закрыть").setDescription("🔒 Закрыть/открыть бота (только владелец)"),
   new SlashCommandBuilder().setName("анкета-канал").setDescription("📋 Отправить кнопку анкеты в этот канал (только владелец)"),
+  new SlashCommandBuilder().setName("тикет-настройка").setDescription("🎫 Отправить панель тикетов в этот канал (только владелец)"),
 ].map(cmd => cmd.toJSON());
 
 async function registerCommands() {
@@ -113,6 +114,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.channel.send({ embeds: [embed], components: [row] });
       await interaction.reply({ content: "✅ Кнопка анкеты отправлена!", flags: 64 });
+    } else if (cmd === "тикет-настройка") {
+      if (!isOwner(userId)) return interaction.reply({ content: "⛔ Нет доступа.", flags: 64 });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x57F287)
+        .setTitle("🎫 Техническая поддержка")
+        .setDescription(
+          "Если у вас возникли вопросы или проблемы — нажмите на кнопку ниже, чтобы создать приватный тикет.\n\n" +
+          "Администрация ответит вам в ближайшее время."
+        )
+        .setFooter({ text: "Тикет виден только вам и администрации" });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("ticket_create")
+          .setLabel("📩 Создать тикет")
+          .setStyle(ButtonStyle.Success)
+      );
+
+      await interaction.channel.send({ embeds: [embed], components: [row] });
+      await interaction.reply({ content: "✅ Панель тикетов отправлена!", flags: 64 });
     }
   }
 
@@ -179,6 +201,92 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const rows2 = fields2.map(f => new ActionRowBuilder().addComponents(f));
     modal2.addComponents(...rows2);
     await interaction.showModal(modal2);
+  }
+
+  // ── Создание тикета ───────────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId === "ticket_create") {
+    const guild = interaction.guild;
+    const user = interaction.user;
+
+    // Проверяем, нет ли уже открытого тикета у этого юзера
+    const existing = guild.channels.cache.find(
+      ch => ch.name === `ticket-${user.username.toLowerCase().replace(/[^a-z0-9]/g, "")}` ||
+            ch.topic === `ticket:${user.id}`
+    );
+    if (existing) {
+      return interaction.reply({
+        content: `У вас уже есть открытый тикет: ${existing}`,
+        flags: 64
+      });
+    }
+
+    // Ищем категорию "Поддержка" (или берём без категории)
+    const category = guild.channels.cache.find(
+      ch => ch.type === 4 && ch.name.toLowerCase().includes("поддержк")
+    );
+
+    // Ищем роль администрации
+    const adminRole = guild.roles.cache.find(
+      r => r.name === "ГЛ.АДМИНИСТРАЦИЯ" || r.name === "Senior Moderators" || r.permissions.has("Administrator")
+    );
+
+    const permissionOverwrites = [
+      { id: guild.id, deny: ["ViewChannel"] }, // @everyone не видит
+      { id: user.id, allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"] },
+    ];
+    if (adminRole) {
+      permissionOverwrites.push({
+        id: adminRole.id,
+        allow: ["ViewChannel", "SendMessages", "ReadMessageHistory", "ManageMessages"]
+      });
+    }
+
+    let ticketChannel;
+    try {
+      ticketChannel = await guild.channels.create({
+        name: `ticket-${user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20)}`,
+        type: 0, // GUILD_TEXT
+        topic: `ticket:${user.id}`,
+        parent: category?.id ?? null,
+        permissionOverwrites,
+      });
+    } catch (e) {
+      console.error("Ошибка создания тикет-канала:", e);
+      return interaction.reply({ content: "❌ Не удалось создать тикет. Проверьте права бота.", flags: 64 });
+    }
+
+    const welcomeEmbed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle("🎫 Тикет создан")
+      .setDescription(
+        `Добро пожаловать, ${user}!\n\n` +
+        "Пожалуйста, опишите вашу проблему здесь.\n" +
+        "Администрация скоро ответит вам."
+      )
+      .setTimestamp();
+
+    const closeRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("ticket_close")
+        .setLabel("🔒 Закрыть тикет")
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    await ticketChannel.send({ embeds: [welcomeEmbed], components: [closeRow] });
+    await interaction.reply({ content: `✅ Ваш тикет создан: ${ticketChannel}`, flags: 64 });
+  }
+
+  // ── Закрытие тикета ───────────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId === "ticket_close") {
+    const channel = interaction.channel;
+
+    // Проверяем что это тикет-канал
+    if (!channel.topic?.startsWith("ticket:") && !channel.name.startsWith("ticket-")) {
+      return interaction.reply({ content: "❌ Это не тикет-канал.", flags: 64 });
+    }
+
+    await interaction.reply({ content: "🔒 Тикет закрывается, канал будет удалён через 5 секунд..." });
+    setTimeout(() => channel.delete("Тикет закрыт").catch(console.error), 5000);
   }
 
   // ── Модальное окно часть 2 ────────────────────────────────────────────────
