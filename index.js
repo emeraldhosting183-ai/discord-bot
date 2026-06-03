@@ -2,7 +2,6 @@ const {
   Client, GatewayIntentBits, Events, REST, Routes,
   SlashCommandBuilder, EmbedBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  ModalBuilder, TextInputBuilder, TextInputStyle
 } = require("discord.js");
 
 const { initQuestionnaire, handleQuestionnaire } = require('./questionnaire');
@@ -19,6 +18,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages,
   ],
 });
 
@@ -26,46 +26,207 @@ let botClosed = false;
 const CLOSED_MESSAGE = "🔒 Бот временно закрыт\n\nМы готовим что-то новое — бот будет недоступен до релиза.";
 function isOwner(userId) { return OWNER_ID && userId === OWNER_ID; }
 
-// ── ВЕРИФИКАЦИЯ ────────────────────────────────────────────────────────────
-const VERIFY_CHANNEL_ID = "1511752308659327198";
+// ── ВЕРИФИКАЦИЯ ЧЕРЕЗ ЛС ───────────────────────────────────────────────────
+//
+// Флоу:
+//  1. Участник пишет боту в ЛС что угодно (или команду /верификация)
+//  2. Бот объясняет: зайди в игру, введи /link, получи код, пришли его сюда
+//  3. Участник присылает код — бот отвечает: введи /discord verify КОД в игре
+//
+// При каждом входе в игру (DiscordSRV HTTP-вебхук POST /login):
+//  1. Бот находит Discord-аккаунт игрока по нику (через linkedAccounts)
+//  2. Пишет в ЛС кнопки "Да, это я" / "Нет, не я"
+//  3. "Нет" или таймаут (60 сек) → POST /kick на сервер Minecraft
+//
+// ── НАСТРОЙКИ ─────────────────────────────────────────────────────────────
 
-async function initVerification(client) {
-  const channel = await client.channels.fetch(VERIFY_CHANNEL_ID).catch(() => null);
-  if (!channel?.isTextBased()) {
-    return console.error(`[Verify] Канал ${VERIFY_CHANNEL_ID} не найден.`);
+// ID HTTP-порта для вебхуков от DiscordSRV (нужен http сервер ниже)
+const WEBHOOK_PORT = process.env.WEBHOOK_PORT || 3000;
+// Секрет для проверки запросов от Minecraft-сервера
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+// URL RCON или HTTP API твоего Minecraft сервера для кика
+// Пример: http://localhost:4567  (если используешь WebAPI плагин)
+const MC_API_URL = process.env.MC_API_URL || "";
+const MC_API_SECRET = process.env.MC_API_SECRET || "";
+
+// Таймаут подтверждения входа (миллисекунды)
+const LOGIN_CONFIRM_TIMEOUT_MS = 60_000;
+
+// Map: discordUserId → { mcNick, resolve } — ожидающие подтверждения
+const pendingLogins = new Map();
+
+// ── ВЕРИФИКАЦИЯ — обработка ЛС ────────────────────────────────────────────
+
+// Когда участник пишет боту в ЛС — показываем инструкцию
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+  // Только ЛС (DM)
+  if (message.guild) return;
+
+  const text = message.content.trim();
+
+  // Если прислал код верификации (числовой или короткая строка)
+  // DiscordSRV генерирует коды вида: 12345 или abcd1
+  const codeMatch = text.match(/^[a-zA-Z0-9]{3,10}$/);
+  if (codeMatch) {
+    const code = text;
+    await message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x57F287)
+          .setTitle("✅ Почти готово!")
+          .setDescription(
+            `Твой код: **\`${code}\`**\n\n` +
+            "Зайди на Minecraft сервер и введи в чат:\n" +
+            `\`/discord verify ${code}\`` +
+            "\n\nПосле этого DiscordSRV автоматически подтвердит тебя!"
+          )
+          .setFooter({ text: "Это сообщение видишь только ты" })
+      ]
+    });
+    return;
   }
 
-  // Не отправлять повторно при рестарте
-  const messages = await channel.messages.fetch({ limit: 20 });
-  const alreadyPosted = messages.some(
-    msg => msg.author.id === client.user.id &&
-           msg.components?.[0]?.components?.some(c => c.customId === "verify_start")
+  // Иначе — показываем инструкцию как получить код
+  await message.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle("🔗 Верификация через Minecraft")
+        .setDescription(
+          "Чтобы привязать свой аккаунт:\n\n" +
+          "**1.** Зайди на наш Minecraft сервер\n" +
+          "**2.** Введи команду `/link` — получишь код\n" +
+          "**3.** Пришли этот код сюда в ЛС\n\n" +
+          "Бот подскажет дальше!"
+        )
+        .setFooter({ text: "Если уже есть код — просто пришли его сюда" })
+    ]
+  });
+});
+
+// ── ПОДТВЕРЖДЕНИЕ ВХОДА — кнопки ─────────────────────────────────────────
+
+async function askLoginConfirm(discordUserId, mcNick) {
+  let dmChannel;
+  try {
+    const user = await client.users.fetch(discordUserId);
+    dmChannel = await user.createDM();
+  } catch {
+    console.error(`[Login] Не удалось открыть ЛС с ${discordUserId}`);
+    return false; // не смогли — пускаем (или кикать — решай сам, меняй на true)
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`login_yes_${discordUserId}`)
+      .setLabel("✅ Да, это я")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`login_no_${discordUserId}`)
+      .setLabel("❌ Нет, не я")
+      .setStyle(ButtonStyle.Danger),
   );
-  if (alreadyPosted) {
-    return console.log("[Verify] Панель верификации уже есть — пропускаем.");
-  }
 
   const embed = new EmbedBuilder()
-    .setColor(0x57F287)
-    .setTitle("✅ Верификация через Minecraft")
+    .setColor(0xFEE75C)
+    .setTitle("⚠️ Вход на сервер")
     .setDescription(
-      "Чтобы подтвердить свой аккаунт:\n\n" +
-      "1. Зайди на наш Minecraft сервер\n" +
-      "2. Введи команду `/link` — получишь код\n" +
-      "3. Нажми кнопку ниже и введи этот код\n\n" +
-      "Бот проверит код и подтвердит тебя!"
+      `Кто-то заходит на сервер с ником **\`${mcNick}\`**.\n\n` +
+      "Это ты?\n\n" +
+      `_Если не ответишь за ${LOGIN_CONFIRM_TIMEOUT_MS / 1000} секунд — игрок будет кикнут._`
     )
-    .setFooter({ text: "Код видит только ты — ответ приходит приватно" });
+    .setTimestamp();
 
-  const btn = new ButtonBuilder()
-    .setCustomId("verify_start")
-    .setLabel("🔗 Ввести код верификации")
-    .setStyle(ButtonStyle.Success);
+  const msg = await dmChannel.send({ embeds: [embed], components: [row] });
 
-  await channel.send({ embeds: [embed], components: [new ActionRowBuilder().addComponents(btn)] });
-  console.log("[Verify] Панель верификации отправлена.");
+  return new Promise((resolve) => {
+    pendingLogins.set(discordUserId, { mcNick, resolve, msg });
+
+    // Таймаут — кик
+    setTimeout(async () => {
+      if (pendingLogins.has(discordUserId)) {
+        pendingLogins.delete(discordUserId);
+        // Редактируем сообщение — убираем кнопки
+        await msg.edit({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xED4245)
+              .setTitle("⏰ Время вышло")
+              .setDescription(`Не получили ответа — игрок **\`${mcNick}\`** кикнут с сервера.`)
+          ],
+          components: []
+        }).catch(() => {});
+        resolve(false); // кик
+      }
+    }, LOGIN_CONFIRM_TIMEOUT_MS);
+  });
 }
-// ──────────────────────────────────────────────────────────────────────────
+
+// ── HTTP-СЕРВЕР для вебхуков от DiscordSRV ────────────────────────────────
+//
+// DiscordSRV не умеет слать вебхуки напрямую, поэтому используй
+// плагин-мост (например DiscordSRV-Addon или собственный Paper плагин)
+// который при событии JOIN шлёт POST /login { secret, discordId, mcNick }
+// При необходимости кика — бот шлёт POST на MC_API_URL/kick { secret, nick }
+
+const http = require("http");
+
+const server = http.createServer(async (req, res) => {
+  if (req.method !== "POST") { res.writeHead(405); return res.end(); }
+
+  let body = "";
+  req.on("data", chunk => body += chunk);
+  req.on("end", async () => {
+    let data;
+    try { data = JSON.parse(body); } catch { res.writeHead(400); return res.end("Bad JSON"); }
+
+    // Проверка секрета
+    if (WEBHOOK_SECRET && data.secret !== WEBHOOK_SECRET) {
+      res.writeHead(403); return res.end("Forbidden");
+    }
+
+    // POST /login — игрок зашёл
+    if (req.url === "/login") {
+      const { discordId, mcNick } = data;
+      if (!discordId || !mcNick) { res.writeHead(400); return res.end("Missing fields"); }
+
+      res.writeHead(200); res.end("OK"); // отвечаем сразу, не ждём
+
+      const confirmed = await askLoginConfirm(discordId, mcNick);
+      if (!confirmed) {
+        await kickPlayer(mcNick);
+      }
+      return;
+    }
+
+    res.writeHead(404); res.end("Not found");
+  });
+});
+
+server.listen(WEBHOOK_PORT, () => {
+  console.log(`[Webhook] HTTP сервер слушает порт ${WEBHOOK_PORT}`);
+});
+
+// ── КИК ИГРОКА ────────────────────────────────────────────────────────────
+
+async function kickPlayer(mcNick) {
+  if (!MC_API_URL) {
+    return console.warn(`[Kick] MC_API_URL не задан — кик ${mcNick} пропущен`);
+  }
+  try {
+    const resp = await fetch(`${MC_API_URL}/kick`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, reason: "Вход не подтверждён в Discord" }),
+    });
+    console.log(`[Kick] ${mcNick} — статус: ${resp.status}`);
+  } catch (e) {
+    console.error(`[Kick] Ошибка кика ${mcNick}:`, e.message);
+  }
+}
+
+// ── Slash команды ─────────────────────────────────────────────────────────
 
 const commands = [
   new SlashCommandBuilder().setName("пинг").setDescription("Проверить работу бота"),
@@ -88,12 +249,46 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Бот запущен как ${c.user.tag}`);
   await registerCommands();
   await initQuestionnaire(client);
-  await initVerification(client);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
 
-  // ── Slash команды ──────────────────────────────────────────────────────────
+  // ── Кнопки подтверждения входа ────────────────────────────────────────
+  if (interaction.isButton()) {
+    if (interaction.customId.startsWith("login_yes_") || interaction.customId.startsWith("login_no_")) {
+      const discordUserId = interaction.customId.replace("login_yes_", "").replace("login_no_", "");
+      const isYes = interaction.customId.startsWith("login_yes_");
+      const pending = pendingLogins.get(discordUserId);
+
+      if (!pending) {
+        return interaction.update({
+          embeds: [new EmbedBuilder().setColor(0x99AAB5).setDescription("⏰ Время ответа истекло.")],
+          components: []
+        });
+      }
+
+      pendingLogins.delete(discordUserId);
+
+      await interaction.update({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(isYes ? 0x57F287 : 0xED4245)
+            .setTitle(isYes ? "✅ Вход подтверждён" : "❌ Вход отклонён")
+            .setDescription(
+              isYes
+                ? `Добро пожаловать на сервер, **\`${pending.mcNick}\`**!`
+                : `Игрок **\`${pending.mcNick}\`** будет кикнут с сервера.`
+            )
+        ],
+        components: []
+      });
+
+      pending.resolve(isYes);
+      return;
+    }
+  }
+
+  // ── Slash команды ──────────────────────────────────────────────────────
   if (interaction.isChatInputCommand()) {
     const userId = interaction.user.id;
     const cmd = interaction.commandName;
@@ -157,54 +352,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // ── Анкета (questionnaire.js) ──────────────────────────────────────────────
+  // ── Анкета ────────────────────────────────────────────────────────────
   await handleQuestionnaire(interaction);
 
-  // ── Верификация — кнопка «Ввести код» ─────────────────────────────────────
-  if (interaction.isButton() && interaction.customId === "verify_start") {
-    const modal = new ModalBuilder()
-      .setCustomId("verify_modal")
-      .setTitle("Верификация Minecraft");
-
-    const codeInput = new TextInputBuilder()
-      .setCustomId("verify_code")
-      .setLabel("Код из Minecraft (/link)")
-      .setStyle(TextInputStyle.Short)
-      .setPlaceholder("Введи код который получил в игре")
-      .setRequired(true)
-      .setMinLength(3)
-      .setMaxLength(20);
-
-    modal.addComponents(new ActionRowBuilder().addComponents(codeInput));
-    return interaction.showModal(modal);
-  }
-
-  // ── Верификация — обработка кода ──────────────────────────────────────────
-  if (interaction.isModalSubmit() && interaction.customId === "verify_modal") {
-    const code = interaction.fields.getTextInputValue("verify_code").trim();
-
-    // Эта часть отвечает только тебе (ephemeral)
-    // DiscordSRV сам проверяет код когда игрок вводит его в чат Minecraft.
-    // Здесь мы показываем инструкцию — что именно ввести в игре.
-    await interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xFEE75C)
-          .setTitle("🔗 Почти готово!")
-          .setDescription(
-            `Твой код: **\`${code}\`**\n\n` +
-            "Зайди на Minecraft сервер и введи в чат:\n" +
-            `\`\`\`/discord verify ${code}\`\`\`` +
-            "\nПосле этого DiscordSRV автоматически подтвердит тебя!"
-          )
-          .setFooter({ text: "Это сообщение видишь только ты" })
-      ],
-      flags: 64 // ephemeral
-    });
-    return;
-  }
-
-  // ── Создание тикета ───────────────────────────────────────────────────────
+  // ── Тикеты ────────────────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId === "ticket_create") {
     const guild = interaction.guild;
     const user = interaction.user;
@@ -214,16 +365,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ch.topic === `ticket:${user.id}`
     );
     if (existing) {
-      return interaction.reply({
-        content: `У вас уже есть открытый тикет: ${existing}`,
-        flags: 64
-      });
+      return interaction.reply({ content: `У вас уже есть открытый тикет: ${existing}`, flags: 64 });
     }
 
     const category = guild.channels.cache.find(
       ch => ch.type === 4 && ch.name.toLowerCase().includes("поддержк")
     );
-
     const adminRole = guild.roles.cache.find(
       r => r.name === "ГЛ.АДМИНИСТРАЦИЯ" || r.name === "Senior Moderators" || r.permissions.has("Administrator")
     );
@@ -256,11 +403,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const welcomeEmbed = new EmbedBuilder()
       .setColor(0x5865F2)
       .setTitle("🎫 Тикет создан")
-      .setDescription(
-        `Добро пожаловать, ${user}!\n\n` +
-        "Пожалуйста, опишите вашу проблему здесь.\n" +
-        "Администрация скоро ответит вам."
-      )
+      .setDescription(`Добро пожаловать, ${user}!\n\nПожалуйста, опишите вашу проблему здесь.\nАдминистрация скоро ответит вам.`)
       .setTimestamp();
 
     const closeRow = new ActionRowBuilder().addComponents(
@@ -274,14 +417,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.reply({ content: `✅ Ваш тикет создан: ${ticketChannel}`, flags: 64 });
   }
 
-  // ── Закрытие тикета ───────────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId === "ticket_close") {
     const channel = interaction.channel;
-
     if (!channel.topic?.startsWith("ticket:") && !channel.name.startsWith("ticket-")) {
       return interaction.reply({ content: "❌ Это не тикет-канал.", flags: 64 });
     }
-
     await interaction.reply({ content: "🔒 Тикет закрывается, канал будет удалён через 5 секунд..." });
     setTimeout(() => channel.delete("Тикет закрыт").catch(console.error), 5000);
   }
