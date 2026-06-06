@@ -3,6 +3,7 @@ const {
   SlashCommandBuilder, EmbedBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
 } = require("discord.js");
+const { Partials } = require("discord.js");
 
 const { initQuestionnaire, handleQuestionnaire } = require('./questionnaire');
 
@@ -18,6 +19,7 @@ const LOGIN_CONFIRM_TIMEOUT_MS = 60_000;
 if (!TOKEN) throw new Error("DISCORD_TOKEN не задан");
 
 const client = new Client({
+  partials: [Partials.Channel, Partials.Message],
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
