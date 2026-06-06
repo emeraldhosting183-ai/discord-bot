@@ -697,32 +697,33 @@ function parseAof(content) {
   return state; // { uuid → discordId }
 }
 
-// uuid → ник кэш
+// uuid → ник кэш (заполняется из usercache.json по SFTP)
 const uuidNickCache = {};
-async function getMcNick(uuid, retries = 3) {
-  if (uuidNickCache[uuid]) return uuidNickCache[uuid];
-  const cleanUuid = uuid.replace(/-/g, "");
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const res = await fetch(
-        `https://sessionserver.mojang.com/session/minecraft/profile/${cleanUuid}`,
-        { signal: AbortSignal.timeout(5000) }
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.name) {
-        uuidNickCache[uuid] = data.name;
-        return data.name;
+
+const SFTP_USERCACHE_PATH = process.env.SFTP_USERCACHE_PATH || "/usercache.json";
+
+async function loadUsercache() {
+  if (!SFTP_HOST || !SFTP_USER || !SFTP_PASS) return;
+  const sftp = new SftpClient();
+  try {
+    await sftp.connect({ host: SFTP_HOST, port: SFTP_PORT, username: SFTP_USER, password: SFTP_PASS, readyTimeout: 5000 });
+    const buf = await sftp.get(SFTP_USERCACHE_PATH);
+    const entries = JSON.parse(buf.toString("utf8"));
+    for (const entry of entries) {
+      if (entry.uuid && entry.name) {
+        uuidNickCache[entry.uuid] = entry.name;
       }
-      throw new Error("No name in response");
-    } catch (e) {
-      console.warn(`[getMcNick] Попытка ${attempt}/${retries} для UUID ${uuid}: ${e.message}`);
-      if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * attempt));
     }
+    console.log(`[usercache] Загружено ${Object.keys(uuidNickCache).length} записей`);
+  } catch (e) {
+    console.error("[usercache] Ошибка загрузки:", e.message);
+  } finally {
+    await sftp.end().catch(() => {});
   }
-  // Если все попытки провалились — НЕ кэшируем, чтобы потом повторить
-  console.error(`[getMcNick] Не удалось получить ник для UUID ${uuid}, используем UUID как fallback`);
-  return null; // явно возвращаем null вместо UUID
+}
+
+function getMcNick(uuid) {
+  return uuidNickCache[uuid] || null;
 }
 
 // Вспомогательная: резолвит ник из аккаунтов — если вдруг там UUID, конвертирует
@@ -730,10 +731,9 @@ function looksLikeUuid(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
 }
 
-async function resolveNick(str) {
+function resolveNick(str) {
   if (looksLikeUuid(str)) {
-    const nick = await getMcNick(str);
-    return nick || str; // если совсем не получилось — UUID лучше чем ничего
+    return getMcNick(str) || str;
   }
   return str;
 }
@@ -838,8 +838,12 @@ client.once(Events.ClientReady, async (c) => {
 
   if (SFTP_HOST) {
     console.log(`[SFTP] Синхронизация каждые ${SFTP_SYNC_MS / 1000}с → ${SFTP_HOST}:${SFTP_PORT}`);
-    await syncAof(); // первый запуск сразу
-    setInterval(syncAof, SFTP_SYNC_MS);
+    await loadUsercache(); // загружаем usercache.json перед первой синхронизацией
+    await syncAof();
+    setInterval(async () => {
+      await loadUsercache(); // обновляем кэш ников перед каждой проверкой AOF
+      await syncAof();
+    }, SFTP_SYNC_MS);
   } else {
     console.log("[SFTP] SFTP_HOST не задан, синхронизация отключена");
   }
