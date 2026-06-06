@@ -7,6 +7,7 @@ const { Partials } = require("discord.js");
 
 const { initQuestionnaire, handleQuestionnaire } = require('./questionnaire');
 const SftpClient = require('ssh2-sftp-client');
+const { Rcon } = require('rcon-client');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -24,6 +25,10 @@ const SFTP_USER     = process.env.SFTP_USER     || "";
 const SFTP_PASS     = process.env.SFTP_PASS     || "";
 const SFTP_AOF_PATH = process.env.SFTP_AOF_PATH || "/plugins/DiscordSRV/accounts.aof";
 const SFTP_SYNC_MS  = parseInt(process.env.SFTP_SYNC_MS || "5000");
+
+const RCON_HOST = process.env.RCON_HOST || SFTP_HOST;
+const RCON_PORT = parseInt(process.env.RCON_PORT || "25643");
+const RCON_PASS = process.env.RCON_PASS || "";
 
 if (!TOKEN) throw new Error("DISCORD_TOKEN не задан");
 
@@ -248,17 +253,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const mcNick = await resolveNick(rawNick);
 
       let kicked = false;
-      if (MC_API_URL) {
-        try {
-          const resp = await fetch(`${MC_API_URL}/kick`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, reason: "Кик через Discord-бота" }),
-          });
-          kicked = resp.ok;
-        } catch (e) {
-          console.error("[Kick]", e.message);
-        }
+      try {
+        const rcon = new Rcon({ host: RCON_HOST, port: RCON_PORT, password: RCON_PASS, timeout: 5000 });
+        await rcon.connect();
+        const response = await rcon.send(`kick ${mcNick} Кик через Discord-бота`);
+        await rcon.end();
+        kicked = true;
+        console.log(`[RCON kick] ${mcNick}: ${response}`);
+      } catch (e) {
+        console.error("[RCON kick]", e.message);
       }
 
       await interaction.editReply({

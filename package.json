@@ -2,9 +2,12 @@
   "name": "discord-bot",
   "version": "2.0.0",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "discord.js": "^14.15.3",
-    "ssh2-sftp-client": "^9.1.0"
+    "ssh2-sftp-client": "^9.1.0",
+    "rcon-client": "^4.2.4"
   }
 }
