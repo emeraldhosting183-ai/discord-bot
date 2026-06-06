@@ -6,6 +6,7 @@ const {
 const { Partials } = require("discord.js");
 
 const { initQuestionnaire, handleQuestionnaire } = require('./questionnaire');
+const SftpClient = require('ssh2-sftp-client');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -16,6 +17,13 @@ const WEBHOOK_PORT = process.env.WEBHOOK_PORT || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const LOGIN_CONFIRM_TIMEOUT_MS = 60_000;
 const MAX_ACCOUNTS = 3;
+
+const SFTP_HOST     = process.env.SFTP_HOST     || "";
+const SFTP_PORT     = parseInt(process.env.SFTP_PORT || "22");
+const SFTP_USER     = process.env.SFTP_USER     || "";
+const SFTP_PASS     = process.env.SFTP_PASS     || "";
+const SFTP_AOF_PATH = process.env.SFTP_AOF_PATH || "/plugins/DiscordSRV/accounts.aof";
+const SFTP_SYNC_MS  = parseInt(process.env.SFTP_SYNC_MS || "5000");
 
 if (!TOKEN) throw new Error("DISCORD_TOKEN не задан");
 
@@ -665,10 +673,139 @@ async function registerCommands() {
   } catch (e) { console.error(e); }
 }
 
+// ── SFTP СИНХРОНИЗАЦИЯ accounts.aof ──────────────────────────────────────
+
+// Парсим AOF: положительный id = привязка, отрицательный = отвязка
+// Формат строки: "discordId uuid"
+function parseAof(content) {
+  const state = {}; // uuid → discordId
+  for (const line of content.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length !== 2) continue;
+    const [rawId, uuid] = parts;
+    const discordId = rawId.replace(/^-/, "");
+    const isUnlink = rawId.startsWith("-");
+    if (isUnlink) {
+      if (state[uuid] === discordId) delete state[uuid];
+    } else {
+      state[uuid] = discordId;
+    }
+  }
+  return state; // { uuid → discordId }
+}
+
+// uuid → ник кэш
+const uuidNickCache = {};
+async function getMcNick(uuid) {
+  if (uuidNickCache[uuid]) return uuidNickCache[uuid];
+  try {
+    const res  = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${uuid.replace(/-/g, "")}`);
+    const data = await res.json();
+    const nick = data.name || uuid;
+    uuidNickCache[uuid] = nick;
+    return nick;
+  } catch {
+    return uuid;
+  }
+}
+
+// Предыдущее состояние AOF { uuid → discordId }
+let prevAofState = null;
+
+async function syncAof() {
+  if (!SFTP_HOST || !SFTP_USER || !SFTP_PASS) return;
+
+  const sftp = new SftpClient();
+  try {
+    await sftp.connect({
+      host: SFTP_HOST,
+      port: SFTP_PORT,
+      username: SFTP_USER,
+      password: SFTP_PASS,
+      readyTimeout: 5000,
+    });
+
+    const buf     = await sftp.get(SFTP_AOF_PATH);
+    const content = buf.toString("utf8");
+    const current = parseAof(content);
+
+    // Первый запуск — просто запоминаем без отправки вебхуков
+    if (prevAofState === null) {
+      prevAofState = current;
+      // Синхронизируем уже привязанные в linkedAccounts
+      for (const [uuid, discordId] of Object.entries(current)) {
+        const nick = await getMcNick(uuid);
+        if (!getAccounts(discordId).includes(nick)) {
+          addAccount(discordId, nick);
+          console.log(`[SFTP sync] Восстановлена привязка: ${nick} → ${discordId}`);
+        }
+      }
+      console.log(`[SFTP] Начальная синхронизация: ${Object.keys(current).length} привязок`);
+      await sftp.end();
+      return;
+    }
+
+    // Новые привязки
+    for (const [uuid, discordId] of Object.entries(current)) {
+      if (prevAofState[uuid] !== discordId) {
+        const nick = await getMcNick(uuid);
+        const added = addAccount(discordId, nick);
+        if (added) {
+          console.log(`[SFTP] Новая привязка: ${nick} → ${discordId}`);
+          // Уведомляем пользователя в ЛС
+          try {
+            const user = await client.users.fetch(discordId);
+            const dm   = await user.createDM();
+            const accounts = getAccounts(discordId);
+            await dm.send({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(0x57F287)
+                  .setTitle("✅ Аккаунт привязан!")
+                  .setDescription(
+                    `Minecraft ник **\`${nick}\`** привязан к твоему Discord.\n\n` +
+                    `Привязанные аккаунты (${accounts.length}/${MAX_ACCOUNTS}):\n` +
+                    accounts.map((n, i) => `**${i + 1}.** \`${n}\``).join("\n")
+                  )
+              ],
+              components: [getMenuRow(discordId)],
+            });
+          } catch (e) {
+            console.error("[SFTP] Не удалось отправить ЛС:", e.message);
+          }
+        }
+      }
+    }
+
+    // Удалённые привязки
+    for (const [uuid, discordId] of Object.entries(prevAofState)) {
+      if (!current[uuid]) {
+        const nick = uuidNickCache[uuid] || uuid;
+        removeAccount(discordId, nick);
+        console.log(`[SFTP] Отвязка: ${nick} → ${discordId}`);
+      }
+    }
+
+    prevAofState = current;
+  } catch (e) {
+    console.error("[SFTP] Ошибка синхронизации:", e.message);
+  } finally {
+    await sftp.end().catch(() => {});
+  }
+}
+
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Бот запущен как ${c.user.tag}`);
   await registerCommands();
   await initQuestionnaire(client);
+
+  if (SFTP_HOST) {
+    console.log(`[SFTP] Синхронизация каждые ${SFTP_SYNC_MS / 1000}с → ${SFTP_HOST}:${SFTP_PORT}`);
+    await syncAof(); // первый запуск сразу
+    setInterval(syncAof, SFTP_SYNC_MS);
+  } else {
+    console.log("[SFTP] SFTP_HOST не задан, синхронизация отключена");
+  }
 });
 
 client.login(TOKEN);
