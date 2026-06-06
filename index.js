@@ -26,51 +26,139 @@ let botClosed = false;
 const CLOSED_MESSAGE = "🔒 Бот временно закрыт\n\nМы готовим что-то новое — бот будет недоступен до релиза.";
 function isOwner(userId) { return OWNER_ID && userId === OWNER_ID; }
 
-// ── ВЕРИФИКАЦИЯ ЧЕРЕЗ ЛС ───────────────────────────────────────────────────
-//
-// Флоу:
-//  1. Участник пишет боту в ЛС что угодно (или команду /верификация)
-//  2. Бот объясняет: зайди в игру, введи /link, получи код, пришли его сюда
-//  3. Участник присылает код — бот отвечает: введи /discord verify КОД в игре
-//
-// При каждом входе в игру (DiscordSRV HTTP-вебхук POST /login):
-//  1. Бот находит Discord-аккаунт игрока по нику (через linkedAccounts)
-//  2. Пишет в ЛС кнопки "Да, это я" / "Нет, не я"
-//  3. "Нет" или таймаут (60 сек) → POST /kick на сервер Minecraft
-//
-// ── НАСТРОЙКИ ─────────────────────────────────────────────────────────────
-
-// ID HTTP-порта для вебхуков от DiscordSRV (нужен http сервер ниже)
 const WEBHOOK_PORT = process.env.WEBHOOK_PORT || 3000;
-// Секрет для проверки запросов от Minecraft-сервера
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
-// URL RCON или HTTP API твоего Minecraft сервера для кика
-// Пример: http://localhost:4567  (если используешь WebAPI плагин)
 const MC_API_URL = process.env.MC_API_URL || "";
 const MC_API_SECRET = process.env.MC_API_SECRET || "";
 
-// Таймаут подтверждения входа (миллисекунды)
 const LOGIN_CONFIRM_TIMEOUT_MS = 60_000;
-
-// Map: discordUserId → { mcNick, resolve } — ожидающие подтверждения
 const pendingLogins = new Map();
 
-// ── ВЕРИФИКАЦИЯ — обработка ЛС ────────────────────────────────────────────
+// ── ПРИВЯЗАННЫЕ АККАУНТЫ (хранилище ник <-> discordId) ───────────────────
+// Заполняется когда Minecraft-сервер шлёт POST /link { discordId, mcNick }
+const linkedAccounts = new Map(); // discordId → mcNick
+const linkedByNick   = new Map(); // mcNick → discordId
 
-// Когда участник пишет боту в ЛС — показываем инструкцию
+// ── ЛС-СООБЩЕНИЯ ─────────────────────────────────────────────────────────
+
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
-  // Только ЛС (DM)
   if (message.guild) return;
 
-  const text = message.content.trim();
+  const text    = message.content.trim();
+  const userId  = message.author.id;
+  const mcNick  = linkedAccounts.get(userId);
 
-  // Если прислал код верификации (числовой или короткая строка)
-  // DiscordSRV генерирует коды вида: 12345 или abcd1
+  // ── Команды управления аккаунтом (только для привязанных) ──────────────
+
+  // !кик / !kick
+  if (text === "!кик" || text === "!kick") {
+    if (!mcNick) {
+      return message.reply({ embeds: [embedNotLinked()] });
+    }
+    const kicked = await kickPlayer(mcNick);
+    return message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(kicked ? 0xED4245 : 0x99AAB5)
+          .setTitle(kicked ? "✅ Персонаж кикнут" : "ℹ Персонаж не онлайн")
+          .setDescription(
+            kicked
+              ? `Твой персонаж **\`${mcNick}\`** был выброшен с сервера.`
+              : `Персонаж **\`${mcNick}\`** сейчас не на сервере.`
+          )
+      ]
+    });
+  }
+
+  // !отвязать / !unlink
+  if (text === "!отвязать" || text === "!unlink") {
+    if (!mcNick) {
+      return message.reply({ embeds: [embedNotLinked()] });
+    }
+    await unlinkAccount(userId, mcNick);
+    return message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xFEE75C)
+          .setTitle("🔓 Аккаунт отвязан")
+          .setDescription(
+            `Связь между Discord и **\`${mcNick}\`** разорвана.\n\n` +
+            "Чтобы привязать снова — зайди в игру и напиши `/link`."
+          )
+      ]
+    });
+  }
+
+  // !пароль <новый> / !password <новый>
+  if (text.startsWith("!пароль ") || text.startsWith("!password ")) {
+    if (!mcNick) {
+      return message.reply({ embeds: [embedNotLinked()] });
+    }
+    const parts   = text.split(" ");
+    const newPass = parts[1];
+
+    if (!newPass || newPass.length < 6) {
+      return message.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xED4245)
+            .setTitle("❌ Пароль слишком короткий")
+            .setDescription("Минимальная длина пароля — **6 символов**.")
+        ]
+      });
+    }
+    if (newPass.length > 30) {
+      return message.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xED4245)
+            .setTitle("❌ Пароль слишком длинный")
+            .setDescription("Максимальная длина пароля — **30 символов**.")
+        ]
+      });
+    }
+
+    const changed = await changePassword(mcNick, newPass);
+    await message.delete().catch(() => {});
+    return message.author.send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(changed ? 0x57F287 : 0xED4245)
+          .setTitle(changed ? "✅ Пароль изменён" : "❌ Ошибка смены пароля")
+          .setDescription(
+            changed
+              ? `Пароль для **\`${mcNick}\`** успешно изменён.\n⚠ Сообщение с паролем удалено из чата.`
+              : "Не удалось изменить пароль. Проверь, что сервер онлайн."
+          )
+      ]
+    });
+  }
+
+  // !помощь / !help
+  if (text === "!помощь" || text === "!help") {
+    return message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x5865F2)
+          .setTitle("📋 Управление аккаунтом")
+          .setDescription(mcNick ? `Привязан: **\`${mcNick}\`**` : "⚠ Аккаунт не привязан")
+          .addFields(
+            { name: "`!кик`",              value: "Выбросить своего персонажа с сервера" },
+            { name: "`!отвязать`",         value: "Отвязать Discord от Minecraft аккаунта" },
+            { name: "`!пароль НовыйПароль`", value: "Сменить пароль AuthMe (сообщение удалится автоматически)" },
+            { name: "`!помощь`",           value: "Показать это меню" },
+          )
+          .setFooter({ text: "Команды работают только в ЛС с ботом" })
+      ]
+    });
+  }
+
+  // ── Верификация — код от DiscordSRV ────────────────────────────────────
   const codeMatch = text.match(/^[a-zA-Z0-9]{3,10}$/);
   if (codeMatch) {
     const code = text;
-    await message.reply({
+    return message.reply({
       embeds: [
         new EmbedBuilder()
           .setColor(0x57F287)
@@ -84,21 +172,22 @@ client.on(Events.MessageCreate, async (message) => {
           .setFooter({ text: "Это сообщение видишь только ты" })
       ]
     });
-    return;
   }
 
-  // Иначе — показываем инструкцию как получить код
-  await message.reply({
+  // ── Приветствие / инструкция ────────────────────────────────────────────
+  return message.reply({
     embeds: [
       new EmbedBuilder()
         .setColor(0x5865F2)
-        .setTitle("🔗 Верификация через Minecraft")
+        .setTitle("🔗 Управление аккаунтом")
         .setDescription(
-          "Чтобы привязать свой аккаунт:\n\n" +
-          "**1.** Зайди на наш Minecraft сервер\n" +
-          "**2.** Введи команду `/link` — получишь код\n" +
-          "**3.** Пришли этот код сюда в ЛС\n\n" +
-          "Бот подскажет дальше!"
+          mcNick
+            ? `Твой аккаунт: **\`${mcNick}\`**\n\nНапиши **\`!помощь\`** для списка команд.`
+            : "Чтобы привязать свой Minecraft аккаунт:\n\n" +
+              "**1.** Зайди на наш Minecraft сервер\n" +
+              "**2.** Введи команду `/link` — получишь код\n" +
+              "**3.** Пришли этот код сюда в ЛС\n\n" +
+              "Бот подскажет дальше!"
         )
         .setFooter({ text: "Если уже есть код — просто пришли его сюда" })
     ]
@@ -114,7 +203,7 @@ async function askLoginConfirm(discordUserId, mcNick) {
     dmChannel = await user.createDM();
   } catch {
     console.error(`[Login] Не удалось открыть ЛС с ${discordUserId}`);
-    return false; // не смогли — пускаем (или кикать — решай сам, меняй на true)
+    return false;
   }
 
   const row = new ActionRowBuilder().addComponents(
@@ -143,11 +232,9 @@ async function askLoginConfirm(discordUserId, mcNick) {
   return new Promise((resolve) => {
     pendingLogins.set(discordUserId, { mcNick, resolve, msg });
 
-    // Таймаут — кик
     setTimeout(async () => {
       if (pendingLogins.has(discordUserId)) {
         pendingLogins.delete(discordUserId);
-        // Редактируем сообщение — убираем кнопки
         await msg.edit({
           embeds: [
             new EmbedBuilder()
@@ -157,18 +244,13 @@ async function askLoginConfirm(discordUserId, mcNick) {
           ],
           components: []
         }).catch(() => {});
-        resolve(false); // кик
+        resolve(false);
       }
     }, LOGIN_CONFIRM_TIMEOUT_MS);
   });
 }
 
-// ── HTTP-СЕРВЕР для вебхуков от DiscordSRV ────────────────────────────────
-//
-// DiscordSRV не умеет слать вебхуки напрямую, поэтому используй
-// плагин-мост (например DiscordSRV-Addon или собственный Paper плагин)
-// который при событии JOIN шлёт POST /login { secret, discordId, mcNick }
-// При необходимости кика — бот шлёт POST на MC_API_URL/kick { secret, nick }
+// ── HTTP-СЕРВЕР для вебхуков от Minecraft ────────────────────────────────
 
 const http = require("http");
 
@@ -181,7 +263,6 @@ const server = http.createServer(async (req, res) => {
     let data;
     try { data = JSON.parse(body); } catch { res.writeHead(400); return res.end("Bad JSON"); }
 
-    // Проверка секрета
     if (WEBHOOK_SECRET && data.secret !== WEBHOOK_SECRET) {
       res.writeHead(403); return res.end("Forbidden");
     }
@@ -191,12 +272,53 @@ const server = http.createServer(async (req, res) => {
       const { discordId, mcNick } = data;
       if (!discordId || !mcNick) { res.writeHead(400); return res.end("Missing fields"); }
 
-      res.writeHead(200); res.end("OK"); // отвечаем сразу, не ждём
+      res.writeHead(200); res.end("OK");
 
       const confirmed = await askLoginConfirm(discordId, mcNick);
       if (!confirmed) {
         await kickPlayer(mcNick);
       }
+      return;
+    }
+
+    // POST /link — аккаунт привязан (Skript шлёт после события DiscordSRV)
+    if (req.url === "/link") {
+      const { discordId, mcNick } = data;
+      if (!discordId || !mcNick) { res.writeHead(400); return res.end("Missing fields"); }
+
+      linkedAccounts.set(discordId, mcNick);
+      linkedByNick.set(mcNick.toLowerCase(), discordId);
+
+      console.log(`[Link] ${mcNick} <-> ${discordId}`);
+      res.writeHead(200); res.end("OK");
+
+      try {
+        const user = await client.users.fetch(discordId);
+        const dm   = await user.createDM();
+        await dm.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x57F287)
+              .setTitle("✅ Аккаунт привязан!")
+              .setDescription(
+                `Minecraft ник **\`${mcNick}\`** успешно привязан к твоему Discord.\n\n` +
+                "Теперь ты можешь управлять аккаунтом прямо здесь в ЛС.\n" +
+                "Напиши **`!помощь`** чтобы увидеть доступные команды."
+              )
+          ]
+        });
+      } catch (e) {
+        console.error("[Link] Не удалось отправить ЛС:", e.message);
+      }
+      return;
+    }
+
+    // POST /unlink — аккаунт отвязан
+    if (req.url === "/unlink") {
+      const { discordId, mcNick } = data;
+      if (discordId) linkedAccounts.delete(discordId);
+      if (mcNick)   linkedByNick.delete(mcNick.toLowerCase());
+      res.writeHead(200); res.end("OK");
       return;
     }
 
@@ -208,11 +330,12 @@ server.listen(WEBHOOK_PORT, () => {
   console.log(`[Webhook] HTTP сервер слушает порт ${WEBHOOK_PORT}`);
 });
 
-// ── КИК ИГРОКА ────────────────────────────────────────────────────────────
+// ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────
 
 async function kickPlayer(mcNick) {
   if (!MC_API_URL) {
-    return console.warn(`[Kick] MC_API_URL не задан — кик ${mcNick} пропущен`);
+    console.warn(`[Kick] MC_API_URL не задан — кик ${mcNick} пропущен`);
+    return false;
   }
   try {
     const resp = await fetch(`${MC_API_URL}/kick`, {
@@ -221,9 +344,56 @@ async function kickPlayer(mcNick) {
       body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, reason: "Вход не подтверждён в Discord" }),
     });
     console.log(`[Kick] ${mcNick} — статус: ${resp.status}`);
+    return resp.ok;
   } catch (e) {
     console.error(`[Kick] Ошибка кика ${mcNick}:`, e.message);
+    return false;
   }
+}
+
+async function changePassword(mcNick, newPass) {
+  if (!MC_API_URL) {
+    console.warn(`[Password] MC_API_URL не задан`);
+    return false;
+  }
+  try {
+    const resp = await fetch(`${MC_API_URL}/changepassword`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, password: newPass }),
+    });
+    console.log(`[Password] ${mcNick} — статус: ${resp.status}`);
+    return resp.ok;
+  } catch (e) {
+    console.error(`[Password] Ошибка:`, e.message);
+    return false;
+  }
+}
+
+async function unlinkAccount(discordId, mcNick) {
+  linkedAccounts.delete(discordId);
+  linkedByNick.delete(mcNick.toLowerCase());
+
+  if (!MC_API_URL) return;
+  try {
+    await fetch(`${MC_API_URL}/unlink`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, discordId }),
+    });
+  } catch (e) {
+    console.error(`[Unlink] Ошибка:`, e.message);
+  }
+}
+
+function embedNotLinked() {
+  return new EmbedBuilder()
+    .setColor(0xED4245)
+    .setTitle("❌ Аккаунт не привязан")
+    .setDescription(
+      "Твой Discord не привязан к Minecraft аккаунту.\n\n" +
+      "Зайди на сервер и напиши `/link` чтобы получить код привязки."
+    );
 }
 
 // ── Slash команды ─────────────────────────────────────────────────────────
@@ -253,7 +423,6 @@ client.once(Events.ClientReady, async (c) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
 
-  // ── Кнопки подтверждения входа ────────────────────────────────────────
   if (interaction.isButton()) {
     if (interaction.customId.startsWith("login_yes_") || interaction.customId.startsWith("login_no_")) {
       const discordUserId = interaction.customId.replace("login_yes_", "").replace("login_no_", "");
@@ -288,7 +457,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // ── Slash команды ──────────────────────────────────────────────────────
   if (interaction.isChatInputCommand()) {
     const userId = interaction.user.id;
     const cmd = interaction.commandName;
@@ -308,7 +476,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { name: "/пинг", value: "Проверить работу бота" },
           { name: "/сервер", value: "Информация о сервере" },
           { name: "/помощь", value: "Этот список" },
-        );
+        )
+        .setFooter({ text: "Управление аккаунтом — в ЛС с ботом (!помощь)" });
       await interaction.reply({ embeds: [embed] });
 
     } else if (cmd === "сервер") {
@@ -352,10 +521,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // ── Анкета ────────────────────────────────────────────────────────────
   await handleQuestionnaire(interaction);
 
-  // ── Тикеты ────────────────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId === "ticket_create") {
     const guild = interaction.guild;
     const user = interaction.user;
