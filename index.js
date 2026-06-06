@@ -239,10 +239,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.customId.startsWith("btn_kick_")) {
       const idx = parseInt(interaction.customId.replace("btn_kick_", ""), 10);
       const accounts = getAccounts(userId);
-      const mcNick = accounts[idx];
-      if (!mcNick) return interaction.reply({ content: "❌ Аккаунт не найден.", flags: 64 });
+      const rawNick = accounts[idx];
+      if (!rawNick) return interaction.reply({ content: "❌ Аккаунт не найден.", flags: 64 });
 
       await interaction.deferReply({ flags: 64 });
+
+      // Если вдруг в списке оказался UUID — резолвим в ник
+      const mcNick = await resolveNick(rawNick);
 
       let kicked = false;
       if (MC_API_URL) {
@@ -696,17 +699,43 @@ function parseAof(content) {
 
 // uuid → ник кэш
 const uuidNickCache = {};
-async function getMcNick(uuid) {
+async function getMcNick(uuid, retries = 3) {
   if (uuidNickCache[uuid]) return uuidNickCache[uuid];
-  try {
-    const res  = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${uuid.replace(/-/g, "")}`);
-    const data = await res.json();
-    const nick = data.name || uuid;
-    uuidNickCache[uuid] = nick;
-    return nick;
-  } catch {
-    return uuid;
+  const cleanUuid = uuid.replace(/-/g, "");
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(
+        `https://sessionserver.mojang.com/session/minecraft/profile/${cleanUuid}`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.name) {
+        uuidNickCache[uuid] = data.name;
+        return data.name;
+      }
+      throw new Error("No name in response");
+    } catch (e) {
+      console.warn(`[getMcNick] Попытка ${attempt}/${retries} для UUID ${uuid}: ${e.message}`);
+      if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * attempt));
+    }
   }
+  // Если все попытки провалились — НЕ кэшируем, чтобы потом повторить
+  console.error(`[getMcNick] Не удалось получить ник для UUID ${uuid}, используем UUID как fallback`);
+  return null; // явно возвращаем null вместо UUID
+}
+
+// Вспомогательная: резолвит ник из аккаунтов — если вдруг там UUID, конвертирует
+function looksLikeUuid(str) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+}
+
+async function resolveNick(str) {
+  if (looksLikeUuid(str)) {
+    const nick = await getMcNick(str);
+    return nick || str; // если совсем не получилось — UUID лучше чем ничего
+  }
+  return str;
 }
 
 // Предыдущее состояние AOF { uuid → discordId }
@@ -735,6 +764,10 @@ async function syncAof() {
       // Синхронизируем уже привязанные в linkedAccounts
       for (const [uuid, discordId] of Object.entries(current)) {
         const nick = await getMcNick(uuid);
+        if (!nick) {
+          console.warn(`[SFTP sync] Не удалось получить ник для UUID ${uuid}, пропускаем`);
+          continue;
+        }
         if (!getAccounts(discordId).includes(nick)) {
           addAccount(discordId, nick);
           console.log(`[SFTP sync] Восстановлена привязка: ${nick} → ${discordId}`);
@@ -749,6 +782,10 @@ async function syncAof() {
     for (const [uuid, discordId] of Object.entries(current)) {
       if (prevAofState[uuid] !== discordId) {
         const nick = await getMcNick(uuid);
+        if (!nick) {
+          console.warn(`[SFTP] Не удалось получить ник для UUID ${uuid}, пропускаем`);
+          continue; // не сохраняем UUID как ник
+        }
         const added = addAccount(discordId, nick);
         if (added) {
           console.log(`[SFTP] Новая привязка: ${nick} → ${discordId}`);
