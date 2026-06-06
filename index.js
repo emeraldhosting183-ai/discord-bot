@@ -15,6 +15,7 @@ const MC_API_SECRET = process.env.MC_API_SECRET || "";
 const WEBHOOK_PORT = process.env.WEBHOOK_PORT || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const LOGIN_CONFIRM_TIMEOUT_MS = 60_000;
+const MAX_ACCOUNTS = 3;
 
 if (!TOKEN) throw new Error("DISCORD_TOKEN не задан");
 
@@ -34,55 +35,132 @@ const CLOSED_MESSAGE = "🔒 Бот временно закрыт\n\nМы гот
 function isOwner(userId) { return OWNER_ID && userId === OWNER_ID; }
 
 // Хранилище привязок и настроек
-const linkedAccounts = new Map(); // discordId → mcNick
+// linkedAccounts: discordId → string[]  (массив ников, макс MAX_ACCOUNTS)
+const linkedAccounts = new Map();
 const notifyEnabled = new Map();  // discordId → true/false
 const pendingLogins = new Map();  // discordId → { mcNick, resolve, msg }
+
+// ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────
+
+function getAccounts(discordId) {
+  return linkedAccounts.get(discordId) || [];
+}
+
+function addAccount(discordId, mcNick) {
+  const accounts = getAccounts(discordId);
+  if (accounts.includes(mcNick)) return false; // уже есть
+  if (accounts.length >= MAX_ACCOUNTS) return false; // лимит
+  accounts.push(mcNick);
+  linkedAccounts.set(discordId, accounts);
+  return true;
+}
+
+function removeAccount(discordId, mcNick) {
+  const accounts = getAccounts(discordId);
+  const idx = accounts.indexOf(mcNick);
+  if (idx === -1) return false;
+  accounts.splice(idx, 1);
+  if (accounts.length === 0) {
+    linkedAccounts.delete(discordId);
+  } else {
+    linkedAccounts.set(discordId, accounts);
+  }
+  return true;
+}
 
 // ── ГЛАВНОЕ МЕНЮ ─────────────────────────────────────────────────────────
 
 function getMenuEmbed(discordId) {
-  const mcNick = linkedAccounts.get(discordId);
+  const accounts = getAccounts(discordId);
   const notify = notifyEnabled.get(discordId) ?? true;
+
+  let accountsLine;
+  if (accounts.length === 0) {
+    accountsLine = "❌ Нет привязанных аккаунтов";
+  } else {
+    accountsLine = accounts.map((n, i) => `**${i + 1}.** \`${n}\``).join("\n");
+  }
 
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle("🎮 Управление аккаунтом")
-    .setDescription(
-      mcNick
-        ? `Привязан: **\`${mcNick}\`**`
-        : "❌ Аккаунт не привязан"
-    )
+    .setDescription(accountsLine)
     .addFields(
-      { name: "🔔 Уведомления о входе", value: notify ? "Включены" : "Выключены", inline: true }
+      { name: "🔔 Уведомления о входе", value: notify ? "Включены" : "Выключены", inline: true },
+      { name: "📋 Слотов использовано", value: `${accounts.length} / ${MAX_ACCOUNTS}`, inline: true },
     )
     .setFooter({ text: "Используй кнопки ниже для управления" });
 }
 
 function getMenuRow(discordId) {
-  const mcNick = linkedAccounts.get(discordId);
+  const accounts = getAccounts(discordId);
   const notify = notifyEnabled.get(discordId) ?? true;
+  const canLink = accounts.length < MAX_ACCOUNTS;
 
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId("btn_link")
       .setLabel("🔗 Привязать")
       .setStyle(ButtonStyle.Primary)
-      .setDisabled(!!mcNick),
+      .setDisabled(!canLink),
     new ButtonBuilder()
-      .setCustomId("btn_unlink")
-      .setLabel("🔓 Отвязать")
+      .setCustomId("btn_accounts")
+      .setLabel("📋 Мои аккаунты")
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!mcNick),
-    new ButtonBuilder()
-      .setCustomId("btn_kick")
-      .setLabel("👢 Кик")
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(!mcNick),
+      .setDisabled(accounts.length === 0),
     new ButtonBuilder()
       .setCustomId("btn_notify")
       .setLabel(notify ? "🔕 Выкл. уведомления" : "🔔 Вкл. уведомления")
       .setStyle(notify ? ButtonStyle.Secondary : ButtonStyle.Success),
   );
+}
+
+// ── EMBED СПИСОК АККАУНТОВ ────────────────────────────────────────────────
+
+function getAccountsEmbed(discordId) {
+  const accounts = getAccounts(discordId);
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle("📋 Привязанные аккаунты")
+    .setDescription(
+      accounts.length === 0
+        ? "❌ Нет привязанных аккаунтов"
+        : accounts.map((n, i) => `**${i + 1}.** \`${n}\``).join("\n")
+    )
+    .setFooter({ text: `Максимум ${MAX_ACCOUNTS} аккаунта • Нажми на кнопку аккаунта для управления` });
+}
+
+function getAccountsRows(discordId) {
+  const accounts = getAccounts(discordId);
+  const rows = [];
+
+  // Ряд кнопок для каждого аккаунта (кик + отвязать)
+  for (let i = 0; i < accounts.length; i++) {
+    const nick = accounts[i];
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`btn_kick_${i}`)
+        .setLabel(`👢 Кик: ${nick}`)
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`btn_unlink_${i}`)
+        .setLabel(`🔓 Отвязать: ${nick}`)
+        .setStyle(ButtonStyle.Secondary),
+    );
+    rows.push(row);
+  }
+
+  // Кнопка «назад»
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("btn_back")
+        .setLabel("◀ Назад")
+        .setStyle(ButtonStyle.Primary),
+    )
+  );
+
+  return rows;
 }
 
 // ── ЛС — показываем меню при любом сообщении ─────────────────────────────
@@ -106,10 +184,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Кнопки меню (только в ЛС)
   if (interaction.isButton() && !interaction.guild) {
     const userId = interaction.user.id;
-    const mcNick = linkedAccounts.get(userId);
 
-    // Привязать
+    // ── Привязать ──
     if (interaction.customId === "btn_link") {
+      const accounts = getAccounts(userId);
+      if (accounts.length >= MAX_ACCOUNTS) {
+        return interaction.reply({ content: `❌ Достигнут лимит: максимум **${MAX_ACCOUNTS}** аккаунта на один Discord.`, flags: 64 });
+      }
       await interaction.reply({
         embeds: [
           new EmbedBuilder()
@@ -119,7 +200,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
               "**1.** Зайди на Minecraft сервер\n" +
               "**2.** Напиши в чате `/discord link`\n" +
               "**3.** Получишь код — пришли его сюда в ЛС\n\n" +
-              "Бот автоматически подтвердит привязку!"
+              "Бот автоматически подтвердит привязку!\n\n" +
+              `> Слотов использовано: **${accounts.length} / ${MAX_ACCOUNTS}**`
             )
         ],
         flags: 64,
@@ -127,37 +209,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // Отвязать
-    if (interaction.customId === "btn_unlink") {
-      if (!mcNick) {
-        return interaction.reply({ content: "❌ Аккаунт не привязан.", flags: 64 });
-      }
-      linkedAccounts.delete(userId);
-
-      if (MC_API_URL) {
-        fetch(`${MC_API_URL}/unlink`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, discordId: userId }),
-        }).catch(() => {});
-      }
-
+    // ── Мои аккаунты ──
+    if (interaction.customId === "btn_accounts") {
       await interaction.update({
-        embeds: [getMenuEmbed(userId)],
-        components: [getMenuRow(userId)],
-      });
-      await interaction.followUp({
-        content: `✅ Аккаунт **\`${mcNick}\`** отвязан.`,
-        flags: 64,
+        embeds: [getAccountsEmbed(userId)],
+        components: getAccountsRows(userId),
       });
       return;
     }
 
-    // Кик
-    if (interaction.customId === "btn_kick") {
-      if (!mcNick) {
-        return interaction.reply({ content: "❌ Аккаунт не привязан.", flags: 64 });
-      }
+    // ── Назад (из вкладки аккаунтов) ──
+    if (interaction.customId === "btn_back") {
+      await interaction.update({
+        embeds: [getMenuEmbed(userId)],
+        components: [getMenuRow(userId)],
+      });
+      return;
+    }
+
+    // ── Кик конкретного аккаунта: btn_kick_0, btn_kick_1, btn_kick_2 ──
+    if (interaction.customId.startsWith("btn_kick_")) {
+      const idx = parseInt(interaction.customId.replace("btn_kick_", ""), 10);
+      const accounts = getAccounts(userId);
+      const mcNick = accounts[idx];
+      if (!mcNick) return interaction.reply({ content: "❌ Аккаунт не найден.", flags: 64 });
 
       await interaction.deferReply({ flags: 64 });
 
@@ -183,7 +258,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // Уведомления вкл/выкл
+    // ── Отвязать конкретный аккаунт: btn_unlink_0, btn_unlink_1, btn_unlink_2 ──
+    if (interaction.customId.startsWith("btn_unlink_")) {
+      const idx = parseInt(interaction.customId.replace("btn_unlink_", ""), 10);
+      const accounts = getAccounts(userId);
+      const mcNick = accounts[idx];
+      if (!mcNick) return interaction.reply({ content: "❌ Аккаунт не найден.", flags: 64 });
+
+      removeAccount(userId, mcNick);
+
+      if (MC_API_URL) {
+        fetch(`${MC_API_URL}/unlink`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, discordId: userId }),
+        }).catch(() => {});
+      }
+
+      // Обновляем вкладку аккаунтов (или возвращаемся в меню если стало пусто)
+      const remaining = getAccounts(userId);
+      if (remaining.length === 0) {
+        await interaction.update({
+          embeds: [getMenuEmbed(userId)],
+          components: [getMenuRow(userId)],
+        });
+        await interaction.followUp({ content: `✅ Аккаунт **\`${mcNick}\`** отвязан.`, flags: 64 });
+      } else {
+        await interaction.update({
+          embeds: [getAccountsEmbed(userId)],
+          components: getAccountsRows(userId),
+        });
+        await interaction.followUp({ content: `✅ Аккаунт **\`${mcNick}\`** отвязан.`, flags: 64 });
+      }
+      return;
+    }
+
+    // ── Уведомления вкл/выкл ──
     if (interaction.customId === "btn_notify") {
       const current = notifyEnabled.get(userId) ?? true;
       notifyEnabled.set(userId, !current);
@@ -465,13 +575,17 @@ const server = http.createServer(async (req, res) => {
 
       const notify = notifyEnabled.get(discordId) ?? true;
       if (notify) {
-        const confirmed = await askLoginConfirm(discordId, mcNick);
-        if (!confirmed && MC_API_URL) {
-          fetch(`${MC_API_URL}/kick`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, reason: "Вход не подтверждён в Discord" }),
-          }).catch(() => {});
+        // Проверяем что этот ник привязан к данному дискорд аккаунту
+        const accounts = getAccounts(discordId);
+        if (accounts.includes(mcNick)) {
+          const confirmed = await askLoginConfirm(discordId, mcNick);
+          if (!confirmed && MC_API_URL) {
+            fetch(`${MC_API_URL}/kick`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ secret: MC_API_SECRET, nick: mcNick, reason: "Вход не подтверждён в Discord" }),
+            }).catch(() => {});
+          }
         }
       }
       return;
@@ -480,12 +594,18 @@ const server = http.createServer(async (req, res) => {
     if (req.url === "/link") {
       const { discordId, mcNick } = data;
       if (!discordId || !mcNick) { res.writeHead(400); return res.end("Missing fields"); }
-      linkedAccounts.set(discordId, mcNick);
+
+      const added = addAccount(discordId, mcNick);
+      if (!added) {
+        // Лимит или уже привязан
+        res.writeHead(409); return res.end("Limit reached or already linked");
+      }
       res.writeHead(200); res.end("OK");
 
       try {
         const user = await client.users.fetch(discordId);
         const dm = await user.createDM();
+        const accounts = getAccounts(discordId);
         await dm.send({
           embeds: [
             new EmbedBuilder()
@@ -493,7 +613,9 @@ const server = http.createServer(async (req, res) => {
               .setTitle("✅ Аккаунт привязан!")
               .setDescription(
                 `Minecraft ник **\`${mcNick}\`** привязан к твоему Discord.\n\n` +
-                "Используй кнопки ниже для управления аккаунтом."
+                `Привязанные аккаунты (${accounts.length}/${MAX_ACCOUNTS}):\n` +
+                accounts.map((n, i) => `**${i + 1}.** \`${n}\``).join("\n") + "\n\n" +
+                "Используй кнопки ниже для управления аккаунтами."
               )
           ],
           components: [getMenuRow(discordId)],
@@ -505,8 +627,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.url === "/unlink") {
-      const { discordId } = data;
-      if (discordId) linkedAccounts.delete(discordId);
+      const { discordId, mcNick } = data;
+      if (discordId && mcNick) {
+        removeAccount(discordId, mcNick);
+      } else if (discordId) {
+        // Отвязать все аккаунты
+        linkedAccounts.delete(discordId);
+      }
       res.writeHead(200); res.end("OK");
       return;
     }
